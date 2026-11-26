@@ -614,6 +614,7 @@ class DistributedStreamer:
             owned: bool = True,
             discover_ranks: bool = True,
             ring_buffers: Optional[int] = None,
+            memory_limit: Optional[int] = None,
     ) -> None:
         """discover_ranks=False skips the discovery of the local ranks, a collective over all the ranks of the process
         group, for a read that runs without its peers. Distributed streaming discovers them regardless."""
@@ -665,7 +666,12 @@ class DistributedStreamer:
             # Passed on as asked. Whether a device destination lets the ring be handed over is the
             # FileStreamer's to decide, because that is where the tensor is copied to the device.
             self.file_streamer.stream_files(
-                file_stream_requests, credentials, device, owned=owned, ring_buffers=ring_buffers
+                file_stream_requests,
+                credentials,
+                device,
+                memory_limit=memory_limit,
+                owned=owned,
+                ring_buffers=ring_buffers,
             )
             built_ring = True
         else:
@@ -688,6 +694,21 @@ class DistributedStreamer:
                 # very differently, and the line reporting them cannot tell them apart otherwise.
                 requests_iterator.slots.label,
             )
+
+    def stream_files_into(
+        self,
+        file_stream_requests: List[FileChunks],
+        dst_tensors: List[List[torch.Tensor]],
+        credentials: Optional[S3Credentials] = None,
+    ) -> None:
+        """Stream ranges directly into caller-provided CPU destination tensors."""
+        self.is_distributed = False
+        self._ring_info = None
+        self.file_streamer.stream_files_into(
+            file_stream_requests,
+            dst_tensors,
+            credentials=credentials,
+        )
 
     def ring_info(self) -> Optional[Tuple[int, int, int, str]]:
         """(rank, num_buffers, buffer_size, label) for the ring the last stream_files built, or

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
-from typing import Collection, Iterator, Optional
+from typing import Collection, Dict, Iterator, Optional, Tuple
 from collections import Counter
 import torch
 import glob
@@ -15,6 +15,7 @@ from timeit import default_timer as timer
 from typing import List
 
 from runai_model_streamer.file_streamer import FileChunks
+from runai_model_streamer.file_streamer.file_streamer import host_or_device
 
 from runai_model_streamer.distributed_streamer import DistributedStreamer
 
@@ -212,6 +213,10 @@ class SafetensorsStreamer:
         # session, not per module: a process can load two models, and a threaded consumer would lose
         # increments to a shared counter.
         self.unaligned_copies = 0
+        # Maps (file_index, chunk_index) -> caller-owned CPU tensor when tensor_dsts is used.
+        self._direct_dsts: Dict[Tuple[int, int], torch.Tensor] = {}
+        # Checkpoint tensor names excluded during the last stream_files() call.
+        self.excluded_tensor_names: set[str] = set()
 
     def __enter__(self) -> SafetensorsStreamer:
         self.file_streamer.__enter__()
@@ -252,6 +257,10 @@ class SafetensorsStreamer:
             is_distributed: bool = False,
             tensor_names: Optional[Collection[str]] = None,
             owned: bool = True,
+            exclude_tensor_names: Optional[Collection[str]] = None,
+            tensor_slices: Optional[Dict[str, Tuple[int, int]]] = None,
+            tensor_dsts: Optional[Dict[str, torch.Tensor]] = None,
+            memory_limit: Optional[int] = None,
         ) -> None:
         # By keyword, so that adding a parameter to stream_files cannot silently shift these into the
         # wrong slots. is_distributed and owned are both bools, so a shift would still run.
@@ -262,6 +271,10 @@ class SafetensorsStreamer:
             is_distributed=is_distributed,
             tensor_names=tensor_names,
             owned=owned,
+            exclude_tensor_names=exclude_tensor_names,
+            tensor_slices=tensor_slices,
+            tensor_dsts=tensor_dsts,
+            memory_limit=memory_limit,
         )
 
 
@@ -273,6 +286,10 @@ class SafetensorsStreamer:
             is_distributed: bool = False,
             tensor_names: Optional[Collection[str]] = None,
             owned: bool = True,
+            exclude_tensor_names: Optional[Collection[str]] = None,
+            tensor_slices: Optional[Dict[str, Tuple[int, int]]] = None,
+            tensor_dsts: Optional[Dict[str, torch.Tensor]] = None,
+            memory_limit: Optional[int] = None,
         ) -> None:
         """Stream the tensors of one or more safetensors files.
 
@@ -282,19 +299,52 @@ class SafetensorsStreamer:
         owned=False yields views into buffers the streamer reuses, so each must be consumed before
         the iteration advances. Retaining one then reads whatever was written next, silently.
 
+        exclude_tensor_names skips the named tensors during this stream (mutually exclusive with
+        tensor_names). Unknown names in exclude_tensor_names are ignored.
+
+        tensor_slices maps tensor name -> (start_row, end_row) along dimension 0 so only that row
+        range is fetched from storage.
+
+        tensor_dsts maps tensor name -> pre-allocated contiguous CPU torch.Tensor, streaming bytes
+        directly into the caller's memory with zero staging ring allocation (requires device="cpu"
+        and is_distributed=False). When tensor_names and exclude_tensor_names are both None,
+        tensor_dsts implicitly selects tensor_dsts.keys().
+
+        memory_limit overrides RUNAI_STREAMER_MEMORY_LIMIT for a non-distributed host ring without
+        mutating os.environ.
+
         Alignment is not under this flag, and nor is a device destination without distributed
         streaming - see docs/src/usage.md.
         """
+        if tensor_names is not None and exclude_tensor_names is not None:
+            raise ValueError("Cannot specify both tensor_names and exclude_tensor_names")
         # None = no filter (today's behavior). str satisfies Collection[str] structurally, so
         # reject it - otherwise `in` below silently becomes substring matching.
         if isinstance(tensor_names, str):
             raise ValueError("tensor_names must be a collection of names, not a single str")
+        if isinstance(exclude_tensor_names, str):
+            raise ValueError("exclude_tensor_names must be a collection of names, not a single str")
         # Empty = certainly a caller bug, reject it up front.
         if tensor_names is not None and len(tensor_names) == 0:
             raise ValueError("tensor_names must not be empty - pass None to load every tensor")
+
+        if tensor_dsts is not None:
+            if host_or_device(device) != "cpu":
+                raise ValueError(
+                    f"tensor_dsts requires device='cpu', got device={device!r}"
+                )
+            if is_distributed:
+                raise ValueError("tensor_dsts is not supported with is_distributed=True")
+            if len(tensor_dsts) == 0:
+                raise ValueError("tensor_dsts must not be empty")
+            if tensor_names is None and exclude_tensor_names is None:
+                tensor_names = tensor_dsts.keys()
+
         # Normalize once for O(1) membership below.
         if tensor_names is not None:
             tensor_names = frozenset(tensor_names)
+        if exclude_tensor_names is not None:
+            exclude_tensor_names = frozenset(exclude_tensor_names)
 
         if is_distributed:
             # Every rank turns this list's ORDER into FileChunks ids, and the ranks then exchange
@@ -314,8 +364,11 @@ class SafetensorsStreamer:
         self.total_size = 0
         self.device_str = device
         self.unaligned_copies = 0
+        self._direct_dsts = {}
+        self.excluded_tensor_names = set()
 
         file_stream_requests: List[FileChunks] = []
+        file_dst_tensors: List[List[torch.Tensor]] = []
 
         # Start the throughput clock here, right before the first submission: prepare_request issues the
         # metadata reads (the first submissions), so the measurement spans first submission -> last response.
@@ -329,27 +382,87 @@ class SafetensorsStreamer:
         # Every kept name, WITH duplicates - only tensor_names carries the expectation of one
         # tensor per requested name, so this is never tracked for the unfiltered load.
         all_kept_names: List[str] = [] if tensor_names is not None else None
+        matched_slice_names = set()
+        needs_custom_offsets = (
+            tensor_names is not None
+            or exclude_tensor_names is not None
+            or tensor_slices is not None
+            or tensor_dsts is not None
+        )
 
         for i in range(len(paths)):
             (file_offset, tensors_metadata, tensor_sizes) = safetensors_metadatas[i]
             path = paths[i]
 
-            if tensor_names is None:
+            if not needs_custom_offsets:
                 self.files_to_tensors_metadata[i] = tensors_metadata
                 self.total_size += sum(tensor_sizes)
                 file_stream_requests.append(FileChunks.contiguous(i, path, file_offset, tensor_sizes))
                 continue
 
-            # Filtered tensors may have gaps between them, so compute each one's absolute file
-            # offset directly instead of the cumulative walk FileChunks.contiguous() does.
-            kept_metadata = [tm for tm in tensors_metadata if tm.name in tensor_names]
-            all_kept_names.extend(tm.name for tm in kept_metadata)
-            kept_offsets = [file_offset + tm.offsets.start for tm in kept_metadata]
-            kept_sizes = [tm.get_bytesize() for tm in kept_metadata]
+            if tensor_names is not None:
+                selected = [tm for tm in tensors_metadata if tm.name in tensor_names]
+            elif exclude_tensor_names is not None:
+                selected = []
+                for tm in tensors_metadata:
+                    if tm.name in exclude_tensor_names:
+                        self.excluded_tensor_names.add(tm.name)
+                    else:
+                        selected.append(tm)
+            else:
+                selected = list(tensors_metadata)
+
+            kept_metadata = []
+            kept_offsets = []
+            kept_sizes = []
+            kept_dsts: List[torch.Tensor] = []
+
+            for tm in selected:
+                if tensor_slices is not None and tm.name in tensor_slices:
+                    start_row, end_row = tensor_slices[tm.name]
+                    sliced_tm, rel_offset, byte_size = tm.slice_dim0(start_row, end_row)
+                    matched_slice_names.add(tm.name)
+                    out_tm = sliced_tm
+                    abs_offset = file_offset + rel_offset
+                else:
+                    out_tm = tm
+                    abs_offset = file_offset + tm.offsets.start
+                    byte_size = tm.get_bytesize()
+
+                if tensor_dsts is not None:
+                    if tm.name not in tensor_dsts:
+                        raise ValueError(
+                            f"tensor_dsts is missing destination tensor for '{tm.name}'"
+                        )
+                    dst = tensor_dsts[tm.name]
+                    if not torch.is_tensor(dst) or dst.device.type != "cpu":
+                        raise ValueError(
+                            f"tensor_dsts['{tm.name}'] must be a CPU torch.Tensor"
+                        )
+                    if not dst.is_contiguous():
+                        raise ValueError(
+                            f"tensor_dsts['{tm.name}'] must be contiguous"
+                        )
+                    if dst.nbytes != byte_size:
+                        raise ValueError(
+                            f"tensor_dsts['{tm.name}'] has {dst.nbytes} bytes, "
+                            f"expected {byte_size} bytes for shape {out_tm.shape} ({out_tm.dtype})"
+                        )
+                    self._direct_dsts[(i, len(kept_metadata))] = dst
+                    kept_dsts.append(dst)
+
+                kept_metadata.append(out_tm)
+                kept_offsets.append(abs_offset)
+                kept_sizes.append(byte_size)
+
+            if all_kept_names is not None:
+                all_kept_names.extend(tm.name for tm in kept_metadata)
 
             self.files_to_tensors_metadata[i] = kept_metadata
             self.total_size += sum(kept_sizes)
             file_stream_requests.append(FileChunks(i, path, kept_offsets, kept_sizes))
+            if tensor_dsts is not None:
+                file_dst_tensors.append(kept_dsts)
 
         if tensor_names is not None:
             # A name only counts as "unknown" if it matched in NONE of the files, not just the
@@ -368,6 +481,21 @@ class SafetensorsStreamer:
                     f"tensor_names requested tensors that appear in more than one file: {duplicates}"
                 )
 
+        if tensor_slices is not None:
+            unused_slices = set(tensor_slices) - matched_slice_names
+            if unused_slices:
+                raise ValueError(
+                    f"tensor_slices keys not found in streamed tensors: {sorted(unused_slices)}"
+                )
+
+        if tensor_dsts is not None:
+            self.file_streamer.stream_files_into(
+                file_stream_requests,
+                file_dst_tensors,
+                credentials=s3_credentials,
+            )
+            return
+
         self.file_streamer.stream_files(
             file_stream_requests,
             credentials=s3_credentials,
@@ -375,6 +503,7 @@ class SafetensorsStreamer:
             is_distributed=is_distributed,
             owned=owned,
             discover_ranks=is_distributed,
+            memory_limit=memory_limit,
         )
         self._log_ring()
 
@@ -407,6 +536,11 @@ class SafetensorsStreamer:
     def get_tensors(self) -> Iterator[torch.tensor]:
         for file_index, ready_chunk_index, buffer in self.file_streamer.get_chunks():
             tensor_metadata = self.files_to_tensors_metadata[file_index][ready_chunk_index]
+
+            direct_dst = self._direct_dsts.get((file_index, ready_chunk_index))
+            if direct_dst is not None:
+                yield tensor_metadata.name, direct_dst
+                continue
 
             # Copied BEFORE the dtype view, and on the uint8 buffer: a copy afterwards would already
             # have had to interpret the address this is here to avoid. Only what has to be copied is,

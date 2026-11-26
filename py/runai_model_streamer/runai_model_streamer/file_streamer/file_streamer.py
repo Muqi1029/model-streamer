@@ -22,6 +22,7 @@ from runai_model_streamer.file_streamer.requests_iterator import (
     FilesRequestsIteratorWithBuffer,
     FilesRequest,
     FileChunks,
+    HOST_SLOTS,
     SlotMemory,
     device_ring_budget,
     device_ring_floor,
@@ -156,6 +157,34 @@ def homogeneous_paths(paths: List[str]) -> bool:
             return False
     return True
 
+class _DirectRequestsIterator:
+    """Minimal stand-in for FilesRequestsIteratorWithBuffer when streaming directly
+    into caller-owned CPU destination tensors (zero staging ring allocation)."""
+
+    slots: SlotMemory = HOST_SLOTS
+    num_buffers: int = 0
+    buffer_size: int = 0
+
+    def __init__(self, dst_views: Dict[Tuple[int, int], torch.Tensor]) -> None:
+        self._dst_views = dst_views
+
+    def has_free_buffer(self) -> bool:
+        return True
+
+    def next_request(self) -> Optional[FilesRequest]:
+        return None
+
+    def release(self, request: FilesRequest, ready_event: Any = None) -> None:
+        return
+
+    def get_global_file_and_range(
+        self, request: FilesRequest, local_file_index: int, local_range_index: int
+    ) -> Tuple[int, int, torch.Tensor]:
+        file_id = request.files[local_file_index].id
+        global_range_index = request.global_range_index(local_file_index, local_range_index)
+        return file_id, global_range_index, self._dst_views[(file_id, global_range_index)]
+
+
 class FileStreamer:
     def __init__(self) -> None:
         # Initialized here (not only in __enter__) so methods such as list_files
@@ -184,6 +213,10 @@ class FileStreamer:
         # released, so the ring can be dropped once the copies out of it have finished.
         self._clone_stream = None
         self._clone_event = None
+        # Caller-owned CPU destination tensors kept alive until runai_end() returns (see
+        # libstreamer.runai_request lifetime contract).
+        self._direct_dst_refs: List[Any] = []
+        self._zero_sentinel = torch.empty(1, dtype=torch.uint8)
 
     def __enter__(self) -> "FileStreamer":
         self.streamer = runai_start()
@@ -214,6 +247,8 @@ class FileStreamer:
         # than kept because a device ring holds up to its whole budget in device memory, and would
         # hold it for the life of this object, competing with the model it has just loaded.
         self.requests_iterator = None
+        # Safe to drop caller destination refs only after runai_end() has joined workers.
+        self._direct_dst_refs.clear()
         # And whatever is parked, which points INTO those slots and would keep them alive after the
         # ring is dropped. The drain does this too, but it runs when the generator is resumed - a
         # generator still held and still paused here has not reached it.
@@ -608,6 +643,105 @@ class FileStreamer:
         self.outstanding = 0
 
         self._submit_while_buffers_free()
+
+    def stream_files_into(
+        self,
+        file_stream_requests: List[FileChunks],
+        dst_tensors: List[List[torch.Tensor]],
+        credentials: Optional[S3Credentials] = None,
+    ) -> None:
+        """Stream file ranges directly into caller-provided contiguous CPU tensors.
+
+        Bypasses the staging ring buffer completely: zero extra host staging memory
+        and no memory-limit rejection even when a single range exceeds
+        RUNAI_STREAMER_MEMORY_LIMIT. Destination tensor references are kept alive
+        until __exit__ (runai_end()) returns.
+        """
+        if self.live_requests or self.outstanding > 0:
+            raise ValueError(
+                f"cannot start a new stream while {len(self.live_requests)} submission(s) and "
+                f"{self.outstanding} response(s) are still live from the previous one - consume or "
+                f"close get_chunks() before calling stream_files_into again"
+            )
+        if len(file_stream_requests) != len(dst_tensors):
+            raise ValueError(
+                f"file_stream_requests ({len(file_stream_requests)}) and dst_tensors "
+                f"({len(dst_tensors)}) must have the same length"
+            )
+        if not homogeneous_paths([req.path for req in file_stream_requests]):
+            raise RunaiStreamerInvalidInputException(
+                "Cannot stream files from multiple source types in parallel"
+            )
+
+        self.device_str = "cpu"
+        self._device = (RUNAI_FILE_STREAMER_DEVICE_CPU, 0)
+        for req in file_stream_requests:
+            req.path = self.handle_object_store(req.path, self.streamer, credentials)
+
+        self._wait_for_copies_out_of_the_ring()
+        self.requests_iterator = None
+
+        request = FilesRequest()
+        dst_views: Dict[Tuple[int, int], torch.Tensor] = {}
+        flat_dsts: List[int] = []
+        sentinel_ptr = self._zero_sentinel.data_ptr()
+
+        for file_chunks, file_dsts in zip(file_stream_requests, dst_tensors):
+            if len(file_chunks.sizes) != len(file_dsts):
+                raise ValueError(
+                    f"file {file_chunks.path!r} has {len(file_chunks.sizes)} ranges "
+                    f"but {len(file_dsts)} destination tensors"
+                )
+            if not file_chunks.sizes:
+                continue
+            request.append(file_chunks, 0)
+            for range_idx, (size, dst) in enumerate(zip(file_chunks.sizes, file_dsts)):
+                if not torch.is_tensor(dst) or dst.device.type != "cpu":
+                    raise ValueError(
+                        f"destination tensor for {file_chunks.path!r} range {range_idx} "
+                        f"must be a CPU torch.Tensor"
+                    )
+                if not dst.is_contiguous():
+                    raise ValueError(
+                        f"destination tensor for {file_chunks.path!r} range {range_idx} "
+                        f"must be contiguous"
+                    )
+                if dst.nbytes != size:
+                    raise ValueError(
+                        f"destination tensor byte size ({dst.nbytes}) does not match "
+                        f"range size ({size}) for {file_chunks.path!r} range {range_idx}"
+                    )
+                self._direct_dst_refs.append(dst)
+                if size == 0:
+                    dst_views[(file_chunks.id, range_idx)] = torch.empty(0, dtype=torch.uint8)
+                    flat_dsts.append(dst.data_ptr() or sentinel_ptr)
+                else:
+                    dst_views[(file_chunks.id, range_idx)] = dst.reshape(-1).view(torch.uint8)
+                    flat_dsts.append(dst.data_ptr())
+
+        self.requests_iterator = _DirectRequestsIterator(dst_views)
+        self.yield_order = yield_order_for(file_stream_requests)
+        self.live_requests = {}
+        self.ranges_not_yielded = {}
+        self.reported_done = set()
+        self.outstanding = 0
+
+        if request.num_ranges == 0:
+            return
+
+        request.range_dsts = flat_dsts
+        submission_id = runai_request(
+            self.streamer,
+            [file_request.path for file_request in request.files],
+            [len(file_request.sizes) for file_request in request.files],
+            [offset for file_request in request.files for offset in file_request.offsets],
+            [size for file_request in request.files for size in file_request.sizes],
+            request.range_dsts,
+            *self._device,
+        )
+        self.live_requests[submission_id] = request
+        self.ranges_not_yielded[submission_id] = request.num_ranges
+        self.outstanding = request.num_ranges
 
     def _submit_while_buffers_free(self) -> None:
         """Fill the ring: build and submit a request for every free buffer, until the data runs out.

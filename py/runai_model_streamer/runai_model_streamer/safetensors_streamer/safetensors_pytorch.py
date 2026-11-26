@@ -297,6 +297,42 @@ class SafetensorMetadata:
             raise ValueError(f"Unsupported dtype '{self.dtype}' in tensor '{self.name}'")
         return safetensors_to_torch_dtype[self.dtype]
 
+    def slice_dim0(self, start_row: int, end_row: int) -> Tuple["SafetensorMetadata", int, int]:
+        """Return (sliced_metadata, relative_byte_offset, byte_size) for rows [start_row, end_row)."""
+        if not self.shape:
+            raise ValueError(
+                f"Cannot slice 0-D tensor '{self.name}' along dim 0"
+            )
+        num_rows = self.shape[0]
+        if not (0 <= start_row <= end_row <= num_rows):
+            raise ValueError(
+                f"Invalid dim-0 slice [{start_row}, {end_row}) for tensor '{self.name}' "
+                f"with shape {self.shape}"
+            )
+        total_bytes = self.get_bytesize()
+        if num_rows == 0:
+            row_bytes = 0
+        else:
+            if total_bytes % num_rows != 0:
+                raise ValueError(
+                    f"Tensor '{self.name}' ({self.shape} x {self.dtype}, {total_bytes} bytes) "
+                    f"does not have an integer byte stride along dim 0"
+                )
+            row_bytes = total_bytes // num_rows
+
+        sliced_rows = end_row - start_row
+        sliced_bytes = sliced_rows * row_bytes
+        rel_offset = self.offsets.start + start_row * row_bytes
+        sliced_meta = SafetensorMetadata(
+            self.name,
+            {
+                SAFETENSORS_DTYPE_KEY: self.dtype,
+                SAFETENSORS_SHAPE_KEY: [sliced_rows, *self.shape[1:]],
+                SAFETENSORS_DATA_OFFSETS_KEY: [0, sliced_bytes],
+            },
+        )
+        return sliced_meta, rel_offset, sliced_bytes
+
 
 class Offsets:
     def __init__(self, offsets: List[int]) -> None:
