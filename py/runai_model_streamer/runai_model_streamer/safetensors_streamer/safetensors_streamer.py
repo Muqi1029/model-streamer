@@ -449,6 +449,15 @@ class SafetensorsStreamer:
                         raise ValueError(
                             f"tensor_dsts['{tm.name}'] must be contiguous"
                         )
+                    # Bytes land verbatim, with no conversion, so a dtype that only
+                    # matches in size would be reinterpreted rather than converted.
+                    expected_dtype = out_tm.get_torch_dtype()
+                    if dst.dtype != expected_dtype:
+                        raise ValueError(
+                            f"tensor_dsts['{tm.name}'] has dtype {dst.dtype}, but the "
+                            f"checkpoint stores {out_tm.dtype} ({expected_dtype}); bytes are "
+                            f"copied verbatim, so the dtypes must match"
+                        )
                     if dst.nbytes != byte_size:
                         raise ValueError(
                             f"tensor_dsts['{tm.name}'] has {dst.nbytes} bytes, "

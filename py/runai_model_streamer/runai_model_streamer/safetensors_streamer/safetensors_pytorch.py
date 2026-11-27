@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 import os
-import threading
+import logging
 import torch
 import torch.distributed as dist
 import struct
@@ -92,23 +92,11 @@ def element_size_of(torch_dtype: torch.dtype) -> int:
     return _element_sizes[torch_dtype]
 
 
+logger = logging.getLogger(__name__)
+
+
 def _is_object_storage_path(path: str) -> bool:
     return is_s3_path(path) or is_gs_path(path) or is_azure_path(path)
-
-
-_HEADER_CACHE_LOCK = threading.Lock()
-# Maps immutable object-storage URI -> (header_size, raw_json_bytes, SafetensorsMetadata).
-_OBJECT_STORAGE_HEADER_CACHE: Dict[str, Tuple[int, bytes, "SafetensorsMetadata"]] = {}
-
-
-def _header_cache_enabled() -> bool:
-    return os.environ.get("RUNAI_STREAMER_HEADER_CACHE", "1") != "0"
-
-
-def clear_metadata_cache() -> None:
-    """Clear the in-process object-storage safetensors header cache."""
-    with _HEADER_CACHE_LOCK:
-        _OBJECT_STORAGE_HEADER_CACHE.clear()
 
 
 def _get_actual_file_size(path: str) -> Optional[int]:
@@ -277,150 +265,108 @@ class SafetensorsMetadata:
         return smeta
 
     @staticmethod
+    def _sharded_raw_headers(
+        fs: DistributedStreamer,
+        filenames: List[str],
+        s3_credentials: Optional[S3Credentials],
+    ) -> Optional[Dict[int, Tuple[int, bytes]]]:
+        """Each rank reads 1/world_size of the headers and the ranks exchange them.
+
+        For object storage only: there every rank would otherwise send the same
+        2 x len(filenames) requests, while a filesystem read is served from the
+        page cache after the first rank. The exchange runs on the gloo discovery
+        group, which this load needs anyway.
+
+        Returns None when this load cannot shard, and the caller reads every header
+        itself. Every rank of a distributed load reaches the same answer, because
+        every input below is job-wide.
+        """
+        params = getattr(fs, "params", None)
+        if not (
+            len(filenames) > 1
+            and all(_is_object_storage_path(p) for p in filenames)
+            and os.environ.get("RUNAI_STREAMER_DIST", "auto") != "0"
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and hasattr(params, "discover_local_ranks")
+            and not _dist_mod._distribution_is_lost()
+        ):
+            return None
+
+        # Discovered BEFORE the first read, as stream_files would: discovery writes
+        # RUNAI_STREAMER_PROCESS_GROUP_SIZE, which the C++ layer reads at its first read.
+        try:
+            params.broadcast_timeout = params.get_broadcast_timeout()
+            params.discover_local_ranks()
+        except Exception:
+            if not _dist_mod._distribution_is_lost():
+                raise
+            return None
+
+        group = _dist_mod._group_cache.get(("discovery",))
+        if group is None:
+            return None
+
+        world_size = dist.get_world_size(group=group)
+        my_rank = dist.get_rank(group=group)
+        mine = [i for i in range(len(filenames)) if i % world_size == my_rank]
+
+        # A read failure travels to every rank instead of raising here, so no rank
+        # is left waiting in the gather for a peer that already gave up.
+        payload: Dict[Any, Any] = {}
+        if mine:
+            try:
+                fetched = SafetensorsMetadata._read_raw_headers(
+                    fs, [filenames[i] for i in mine], s3_credentials, discover_ranks=False
+                )
+                payload = {i: fetched[k] for k, i in enumerate(mine)}
+            except Exception as error:
+                payload = {"__error__": str(error)}
+
+        gathered: List[Any] = [None] * world_size
+        try:
+            dist.all_gather_object(gathered, payload, group=group)
+        except Exception:
+            # The same contract as the other discovery-machinery collectives: the
+            # job stops distributing (see _lose_distribution) and this load reads
+            # its own headers. A peer that did complete the gather already holds
+            # every header and needs nothing more.
+            _dist_mod._lose_distribution()
+            logger.warning(
+                "[RunAI Streamer] Could not exchange safetensors headers between ranks - "
+                "reading every header on this rank", exc_info=True)
+            return None
+
+        merged: Dict[int, Tuple[int, bytes]] = {}
+        for part in gathered:
+            if "__error__" in part:
+                raise ValueError(part["__error__"])
+            merged.update(part)
+        return merged
+
+    @staticmethod
     def from_files(
         fs: DistributedStreamer,
         filenames: List[str],
         s3_credentials: Optional[S3Credentials],
         discover_ranks: bool = True,
     ) -> List["SafetensorsMetadata"]:
-        if not filenames:
-            return []
-
-        cache_enabled = _header_cache_enabled()
-        all_obj = all(_is_object_storage_path(p) for p in filenames)
-
-        # Distributed header sharding: when streaming many object-storage shards
-        # across ranks, let each rank fetch only its 1/world_size share of headers
-        # and exchange the small JSON bytes over the cached gloo discovery group.
-        # This cuts object-storage header QPS by world_size (e.g. 4x/8x).
-        params = getattr(fs, "params", None)
-        can_shard = (
-            discover_ranks
-            and all_obj
-            and len(filenames) > 1
-            and os.environ.get("RUNAI_STREAMER_DIST", "auto") != "0"
-            and dist.is_initialized()
-            and dist.get_world_size() > 1
-            and not _dist_mod._distribution_is_lost()
-            and hasattr(params, "discover_local_ranks")
+        # Only a distributed load shards: discover_ranks is what says every rank is
+        # making this same call.
+        raw_headers = (
+            SafetensorsMetadata._sharded_raw_headers(fs, filenames, s3_credentials)
+            if discover_ranks else None
         )
-        if can_shard:
-            try:
-                params.discover_local_ranks()
-            except Exception:
-                if not _dist_mod._distribution_is_lost():
-                    raise
-                can_shard = False
+        if raw_headers is None:
+            # a distributed load discovers in its first read, because that read fixes the queue depth of the CPP layer
+            raw_headers = SafetensorsMetadata._read_raw_headers(
+                fs, filenames, s3_credentials, discover_ranks=discover_ranks
+            )
 
-            discovery_group = _dist_mod._group_cache.get(("discovery",)) if can_shard else None
-            if discovery_group is not None:
-                world_size = dist.get_world_size(group=discovery_group)
-                my_rank = dist.get_rank(group=discovery_group)
-                my_indices = [i for i in range(len(filenames)) if i % world_size == my_rank]
-
-                local_payload: Dict[Any, Any] = {}
-                to_fetch_indices: List[int] = []
-                if cache_enabled:
-                    with _HEADER_CACHE_LOCK:
-                        for i in my_indices:
-                            entry = _OBJECT_STORAGE_HEADER_CACHE.get(filenames[i])
-                            if entry is not None:
-                                local_payload[i] = (entry[0], entry[1])
-                            else:
-                                to_fetch_indices.append(i)
-                else:
-                    to_fetch_indices = my_indices
-
-                if to_fetch_indices:
-                    try:
-                        fetched = SafetensorsMetadata._read_raw_headers(
-                            fs,
-                            [filenames[i] for i in to_fetch_indices],
-                            s3_credentials,
-                            discover_ranks=False,
-                        )
-                        for local_i, global_i in enumerate(to_fetch_indices):
-                            local_payload[global_i] = fetched[local_i]
-                    except Exception as exc:
-                        local_payload = {"__error__": str(exc)}
-
-                gathered: List[Any] = [None] * world_size
-                dist.all_gather_object(gathered, local_payload, group=discovery_group)
-
-                merged: Dict[int, Tuple[int, bytes]] = {}
-                for part in gathered:
-                    if "__error__" in part:
-                        raise ValueError(part["__error__"])
-                    merged.update(part)
-
-                results: List[SafetensorsMetadata] = []
-                new_cache_entries: Dict[str, Tuple[int, bytes, SafetensorsMetadata]] = {}
-                cached_smetas: Dict[str, SafetensorsMetadata] = {}
-                if cache_enabled:
-                    with _HEADER_CACHE_LOCK:
-                        for p in filenames:
-                            entry = _OBJECT_STORAGE_HEADER_CACHE.get(p)
-                            if entry is not None:
-                                cached_smetas[p] = entry[2]
-
-                for i, path in enumerate(filenames):
-                    smeta = cached_smetas.get(path)
-                    if smeta is None:
-                        header_size, raw_json = merged[i]
-                        smeta = SafetensorsMetadata._build_metadata_from_raw(path, header_size, raw_json)
-                        if cache_enabled:
-                            new_cache_entries[path] = (header_size, raw_json, smeta)
-                    results.append(smeta)
-
-                if new_cache_entries:
-                    with _HEADER_CACHE_LOCK:
-                        _OBJECT_STORAGE_HEADER_CACHE.update(new_cache_entries)
-                return results
-
-        # Non-sharded path: reuse cached metadata for immutable object-storage paths.
-        cached_results: Dict[int, SafetensorsMetadata] = {}
-        uncached_indices: List[int] = []
-        if cache_enabled:
-            with _HEADER_CACHE_LOCK:
-                for i, path in enumerate(filenames):
-                    if _is_object_storage_path(path) and path in _OBJECT_STORAGE_HEADER_CACHE:
-                        cached_results[i] = _OBJECT_STORAGE_HEADER_CACHE[path][2]
-                    else:
-                        uncached_indices.append(i)
-        else:
-            uncached_indices = list(range(len(filenames)))
-
-        if not uncached_indices:
-            if discover_ranks and hasattr(params, "discover_local_ranks"):
-                try:
-                    params.discover_local_ranks()
-                except Exception:
-                    if not _dist_mod._distribution_is_lost():
-                        raise
-            return [cached_results[i] for i in range(len(filenames))]
-
-        # a distributed load discovers in its first read, because that read fixes the queue depth of the CPP layer
-        raw_headers = SafetensorsMetadata._read_raw_headers(
-            fs,
-            [filenames[i] for i in uncached_indices],
-            s3_credentials,
-            discover_ranks=discover_ranks,
-        )
-
-        new_cache_entries = {}
-        for local_i, global_i in enumerate(uncached_indices):
-            path = filenames[global_i]
-            header_size, raw_json = raw_headers[local_i]
-            smeta = SafetensorsMetadata._build_metadata_from_raw(path, header_size, raw_json)
-            cached_results[global_i] = smeta
-            if cache_enabled and _is_object_storage_path(path):
-                new_cache_entries[path] = (header_size, raw_json, smeta)
-
-        if new_cache_entries:
-            with _HEADER_CACHE_LOCK:
-                _OBJECT_STORAGE_HEADER_CACHE.update(new_cache_entries)
-
-        return [cached_results[i] for i in range(len(filenames))]
+        return [
+            SafetensorsMetadata._build_metadata_from_raw(filenames[i], *raw_headers[i])
+            for i in range(len(filenames))
+        ]
 
 class SafetensorMetadata:
     def __init__(self, name: str, safetensorMetadata: Any) -> None:
