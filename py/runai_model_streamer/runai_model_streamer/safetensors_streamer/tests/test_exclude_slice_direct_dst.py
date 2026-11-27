@@ -205,6 +205,103 @@ class TestExcludeSliceAndDirectDst(unittest.TestCase):
 
         self.assertTrue(torch.equal(loaded["big"], big))
 
+    def test_object_storage_header_cache_and_distributed_sharding(self):
+        import json
+        import struct
+        from types import SimpleNamespace
+        from runai_model_streamer.safetensors_streamer import safetensors_pytorch as sp
+        from runai_model_streamer.distributed_streamer import distributed_streamer as dist_mod
+
+        sp.clear_metadata_cache()
+        try:
+            headers_by_path = {}
+            for i in range(4):
+                path = f"s3://unit-bucket/shard-{i}.safetensors"
+                blob = {
+                    f"w{i}": {
+                        "dtype": "F32",
+                        "shape": [2, 2],
+                        "data_offsets": [0, 16],
+                    }
+                }
+                raw = json.dumps(blob).encode("utf-8")
+                headers_by_path[path] = raw
+
+            class FakeFS:
+                def __init__(self):
+                    self.stream_calls = []
+                    self._pending = []
+                    self.params = SimpleNamespace(discover_local_ranks=lambda: None)
+
+                def stream_files(self, reqs, *_args, **_kwargs):
+                    self.stream_calls.append([r.path for r in reqs])
+                    self._pending = []
+                    for r in reqs:
+                        raw = headers_by_path[r.path]
+                        if r.offsets[0] == 0 and r.sizes[0] == 8:
+                            buf = torch.frombuffer(bytearray(struct.pack("<Q", len(raw))), dtype=torch.uint8)
+                        else:
+                            buf = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+                        self._pending.append((r.id, 0, buf))
+
+                def get_chunks(self):
+                    yield from self._pending
+
+            paths = list(headers_by_path.keys())
+            fs1 = FakeFS()
+            metas1 = sp.SafetensorsMetadata.from_files(fs1, paths, None, discover_ranks=False)
+            self.assertEqual(len(metas1), 4)
+            self.assertEqual(len(fs1.stream_calls), 2)
+
+            # Second call hits in-process cache -> zero storage reads.
+            fs2 = FakeFS()
+            metas2 = sp.SafetensorsMetadata.from_files(fs2, paths, None, discover_ranks=False)
+            self.assertEqual(len(fs2.stream_calls), 0)
+            self.assertEqual([m.tensors_metadata[0].name for m in metas2], ["w0", "w1", "w2", "w3"])
+
+            # Distributed header sharding across 2 ranks: each rank fetches only half the files.
+            sp.clear_metadata_cache()
+            fs_r0 = FakeFS()
+            fs_r1 = FakeFS()
+            fake_group = object()
+            payloads = {}
+
+            def fake_all_gather(gathered, obj, group=None):
+                gathered[0] = payloads[0]
+                gathered[1] = payloads[1]
+
+            # Run rank 0 and rank 1 fetch phases separately, then verify all_gather merges all 4.
+            for rank, fs in ((0, fs_r0), (1, fs_r1)):
+                my_indices = [i for i in range(4) if i % 2 == rank]
+                fetched = sp.SafetensorsMetadata._read_raw_headers(
+                    fs, [paths[i] for i in my_indices], None, discover_ranks=False
+                )
+                payloads[rank] = {my_indices[k]: fetched[k] for k in range(len(my_indices))}
+            self.assertEqual(fs_r0.stream_calls[0], [paths[0], paths[2]])
+            self.assertEqual(fs_r1.stream_calls[0], [paths[1], paths[3]])
+
+            # Full from_files() sharded path on rank 0 with mocked dist collective.
+            sp.clear_metadata_cache()
+            fs_sharded = FakeFS()
+            with (
+                patch.object(sp.dist, "is_initialized", return_value=True),
+                patch.object(sp.dist, "get_world_size", return_value=2),
+                patch.object(sp.dist, "get_rank", return_value=0),
+                patch.object(sp.dist, "all_gather_object", side_effect=fake_all_gather),
+                patch.object(dist_mod, "_group_cache", {("discovery",): fake_group}),
+                patch.object(dist_mod, "_distribution_is_lost", return_value=False),
+            ):
+                metas_sharded = sp.SafetensorsMetadata.from_files(
+                    fs_sharded, paths, None, discover_ranks=True
+                )
+            self.assertEqual(fs_sharded.stream_calls[0], [paths[0], paths[2]])
+            self.assertEqual(
+                [m.tensors_metadata[0].name for m in metas_sharded],
+                ["w0", "w1", "w2", "w3"],
+            )
+        finally:
+            sp.clear_metadata_cache()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -374,10 +374,16 @@ class SafetensorsStreamer:
         # metadata reads (the first submissions), so the measurement spans first submission -> last response.
         self.start_time = timer()
 
-        # metadata is created on cpu and each process reads it individually
+        # metadata is created on cpu and each process reads it individually (or shards
+        # across ranks for object storage when is_distributed=True).
         safetensors_metadatas = safetensors_pytorch.prepare_request(
             self.file_streamer, paths, s3_credentials, discover_ranks=is_distributed
         )
+        prepare_elapsed = timer() - self.start_time
+        if prepare_elapsed >= 1.0:
+            logger.info(
+                f"[RunAI Streamer] Prepared headers for {len(paths)} file(s) to {device} in {prepare_elapsed:.2f}s"
+            )
 
         # Every kept name, WITH duplicates - only tensor_names carries the expectation of one
         # tensor per requested name, so this is never tracked for the unfiltered load.

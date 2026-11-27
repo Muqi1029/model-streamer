@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 import os
+import threading
 import torch
+import torch.distributed as dist
 import struct
 import json
-from typing import List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any
+from runai_model_streamer.distributed_streamer import distributed_streamer as _dist_mod
 from runai_model_streamer.distributed_streamer.distributed_streamer import (DistributedStreamer, FileChunks)
 from runai_model_streamer.s3_utils.s3_utils import S3Credentials, is_s3_path, is_gs_path, is_azure_path
 
@@ -89,10 +92,29 @@ def element_size_of(torch_dtype: torch.dtype) -> int:
     return _element_sizes[torch_dtype]
 
 
+def _is_object_storage_path(path: str) -> bool:
+    return is_s3_path(path) or is_gs_path(path) or is_azure_path(path)
+
+
+_HEADER_CACHE_LOCK = threading.Lock()
+# Maps immutable object-storage URI -> (header_size, raw_json_bytes, SafetensorsMetadata).
+_OBJECT_STORAGE_HEADER_CACHE: Dict[str, Tuple[int, bytes, "SafetensorsMetadata"]] = {}
+
+
+def _header_cache_enabled() -> bool:
+    return os.environ.get("RUNAI_STREAMER_HEADER_CACHE", "1") != "0"
+
+
+def clear_metadata_cache() -> None:
+    """Clear the in-process object-storage safetensors header cache."""
+    with _HEADER_CACHE_LOCK:
+        _OBJECT_STORAGE_HEADER_CACHE.clear()
+
+
 def _get_actual_file_size(path: str) -> Optional[int]:
     """Physical size of path, local filesystem only. Object storage not checked - costs extra
     requests on the hot loading path either way; see issue #197 for the zero-cost fix."""
-    if is_s3_path(path) or is_gs_path(path) or is_azure_path(path):
+    if _is_object_storage_path(path):
         return None
     return os.path.getsize(path)
 
@@ -169,16 +191,27 @@ class SafetensorsMetadata:
             self.read_sizes.append(required_size)
 
     @staticmethod
-    def from_files(fs: DistributedStreamer, filenames: List[str], s3_credentials: Optional[S3Credentials], discover_ranks: bool = True) -> List[SafetensorsMetadata]:
-        # a distributed load discovers in its first read, because that read fixes the queue depth of the CPP layer
+    def _read_raw_headers(
+        fs: DistributedStreamer,
+        filenames: List[str],
+        s3_credentials: Optional[S3Credentials],
+        discover_ranks: bool = True,
+    ) -> Dict[int, Tuple[int, bytes]]:
         # 1. Read the first 8 bytes (The Header Size)
         # ring_buffers=1: this sweep is one 8-byte range per file, and at the default depth the ring
         # gives each range its own buffer - so 17 shards become 17 submissions, each a full round-trip
         # through the C++ layer to read 8 bytes. There is nothing to overlap here either way.
-        fs.stream_files([FileChunks.contiguous(i, filenames[i], 0, [SAFETENSORS_HEADER_BUFFER_SIZE]) for i in range(len(filenames))], s3_credentials, "cpu", False, discover_ranks=discover_ranks, ring_buffers=1)
-        
-        header_sizes = {}
-        
+        fs.stream_files(
+            [FileChunks.contiguous(i, filenames[i], 0, [SAFETENSORS_HEADER_BUFFER_SIZE]) for i in range(len(filenames))],
+            s3_credentials,
+            "cpu",
+            False,
+            discover_ranks=discover_ranks,
+            ring_buffers=1,
+        )
+
+        header_sizes: Dict[int, int] = {}
+
         # Wrap the first loop to catch truncation during size read
         try:
             for file_index, ready_chunk_index, buffer in fs.get_chunks():
@@ -190,43 +223,204 @@ class SafetensorsMetadata:
                 )[0]
 
                 if size > MAX_HEADER_SIZE:
-                     raise ValueError(f"Corrupted File: Header size {size} in {filenames[file_index]} exceeds limit of {MAX_HEADER_SIZE} bytes.")
-                
+                    raise ValueError(
+                        f"Corrupted File: Header size {size} in {filenames[file_index]} "
+                        f"exceeds limit of {MAX_HEADER_SIZE} bytes."
+                    )
+
                 header_sizes[file_index] = size
         except Exception as e:
-            # Catch the generic libstreamer error and re-raise as ValueError for consistency
-            if isinstance(e, ValueError): raise e
+            if isinstance(e, ValueError):
+                raise e
             raise ValueError(f"Streamer failed to read header size (likely truncated file): {str(e)}")
 
         # 2. Read the JSON Header Body
-        metadatas = {}
-        fs.stream_files([FileChunks.contiguous(i, filenames[i], SAFETENSORS_HEADER_BUFFER_SIZE, [header_size]) for i, header_size in header_sizes.items()], s3_credentials, "cpu", False, discover_ranks=discover_ranks, ring_buffers=1)
-        
-        # Wrap the second loop to catch truncation during JSON read
+        raw_headers: Dict[int, Tuple[int, bytes]] = {}
+        fs.stream_files(
+            [
+                FileChunks.contiguous(i, filenames[i], SAFETENSORS_HEADER_BUFFER_SIZE, [header_size])
+                for i, header_size in header_sizes.items()
+            ],
+            s3_credentials,
+            "cpu",
+            False,
+            discover_ranks=discover_ranks,
+            ring_buffers=1,
+        )
+
         try:
             for file_index, ready_chunk_index, buffer in fs.get_chunks():
-                try:
-                    json_bytes = bytearray(buffer.numpy())
-                    json_str = json_bytes.decode('utf-8')
-                    metadatas[file_index] = json.loads(json_str)
-                except UnicodeDecodeError:
-                    raise ValueError(f"Corrupted File: Header in {filenames[file_index]} is not valid UTF-8.")
-                except json.JSONDecodeError as e:
-                    raise ValueError(f"Corrupted File: Header in {filenames[file_index]} is not valid JSON. Error: {e}")
+                raw_headers[file_index] = (header_sizes[file_index], bytes(buffer.numpy()))
         except Exception as e:
-            if isinstance(e, ValueError): raise e
+            if isinstance(e, ValueError):
+                raise e
             raise ValueError(f"Streamer failed to read header body (likely truncated file): {str(e)}")
 
-        results = []
-        for i in range(len(filenames)):
-            smeta = SafetensorsMetadata(metadatas[i], header_sizes[i] + SAFETENSORS_HEADER_BUFFER_SIZE)
-            # SafetensorsMetadata guarantees the first tensor starts at 0 and no gaps follow, so
-            # the last tensor's end is the full declared data size.
-            last_end = smeta.tensors_metadata[-1].offsets.end if smeta.tensors_metadata else 0
-            actual_bytes = _get_actual_file_size(filenames[i])
-            _validate_physical_length(filenames[i], smeta.offset + last_end, actual_bytes)
-            results.append(smeta)
-        return results
+        return raw_headers
+
+    @staticmethod
+    def _build_metadata_from_raw(path: str, header_size: int, raw_json: bytes) -> "SafetensorsMetadata":
+        try:
+            json_str = raw_json.decode("utf-8")
+            blob = json.loads(json_str)
+        except UnicodeDecodeError:
+            raise ValueError(f"Corrupted File: Header in {path} is not valid UTF-8.")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Corrupted File: Header in {path} is not valid JSON. Error: {e}")
+
+        smeta = SafetensorsMetadata(blob, header_size + SAFETENSORS_HEADER_BUFFER_SIZE)
+        # SafetensorsMetadata guarantees the first tensor starts at 0 and no gaps follow, so
+        # the last tensor's end is the full declared data size.
+        last_end = smeta.tensors_metadata[-1].offsets.end if smeta.tensors_metadata else 0
+        actual_bytes = _get_actual_file_size(path)
+        _validate_physical_length(path, smeta.offset + last_end, actual_bytes)
+        return smeta
+
+    @staticmethod
+    def from_files(
+        fs: DistributedStreamer,
+        filenames: List[str],
+        s3_credentials: Optional[S3Credentials],
+        discover_ranks: bool = True,
+    ) -> List["SafetensorsMetadata"]:
+        if not filenames:
+            return []
+
+        cache_enabled = _header_cache_enabled()
+        all_obj = all(_is_object_storage_path(p) for p in filenames)
+
+        # Distributed header sharding: when streaming many object-storage shards
+        # across ranks, let each rank fetch only its 1/world_size share of headers
+        # and exchange the small JSON bytes over the cached gloo discovery group.
+        # This cuts object-storage header QPS by world_size (e.g. 4x/8x).
+        params = getattr(fs, "params", None)
+        can_shard = (
+            discover_ranks
+            and all_obj
+            and len(filenames) > 1
+            and os.environ.get("RUNAI_STREAMER_DIST", "auto") != "0"
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and not _dist_mod._distribution_is_lost()
+            and hasattr(params, "discover_local_ranks")
+        )
+        if can_shard:
+            try:
+                params.discover_local_ranks()
+            except Exception:
+                if not _dist_mod._distribution_is_lost():
+                    raise
+                can_shard = False
+
+            discovery_group = _dist_mod._group_cache.get(("discovery",)) if can_shard else None
+            if discovery_group is not None:
+                world_size = dist.get_world_size(group=discovery_group)
+                my_rank = dist.get_rank(group=discovery_group)
+                my_indices = [i for i in range(len(filenames)) if i % world_size == my_rank]
+
+                local_payload: Dict[Any, Any] = {}
+                to_fetch_indices: List[int] = []
+                if cache_enabled:
+                    with _HEADER_CACHE_LOCK:
+                        for i in my_indices:
+                            entry = _OBJECT_STORAGE_HEADER_CACHE.get(filenames[i])
+                            if entry is not None:
+                                local_payload[i] = (entry[0], entry[1])
+                            else:
+                                to_fetch_indices.append(i)
+                else:
+                    to_fetch_indices = my_indices
+
+                if to_fetch_indices:
+                    try:
+                        fetched = SafetensorsMetadata._read_raw_headers(
+                            fs,
+                            [filenames[i] for i in to_fetch_indices],
+                            s3_credentials,
+                            discover_ranks=False,
+                        )
+                        for local_i, global_i in enumerate(to_fetch_indices):
+                            local_payload[global_i] = fetched[local_i]
+                    except Exception as exc:
+                        local_payload = {"__error__": str(exc)}
+
+                gathered: List[Any] = [None] * world_size
+                dist.all_gather_object(gathered, local_payload, group=discovery_group)
+
+                merged: Dict[int, Tuple[int, bytes]] = {}
+                for part in gathered:
+                    if "__error__" in part:
+                        raise ValueError(part["__error__"])
+                    merged.update(part)
+
+                results: List[SafetensorsMetadata] = []
+                new_cache_entries: Dict[str, Tuple[int, bytes, SafetensorsMetadata]] = {}
+                cached_smetas: Dict[str, SafetensorsMetadata] = {}
+                if cache_enabled:
+                    with _HEADER_CACHE_LOCK:
+                        for p in filenames:
+                            entry = _OBJECT_STORAGE_HEADER_CACHE.get(p)
+                            if entry is not None:
+                                cached_smetas[p] = entry[2]
+
+                for i, path in enumerate(filenames):
+                    smeta = cached_smetas.get(path)
+                    if smeta is None:
+                        header_size, raw_json = merged[i]
+                        smeta = SafetensorsMetadata._build_metadata_from_raw(path, header_size, raw_json)
+                        if cache_enabled:
+                            new_cache_entries[path] = (header_size, raw_json, smeta)
+                    results.append(smeta)
+
+                if new_cache_entries:
+                    with _HEADER_CACHE_LOCK:
+                        _OBJECT_STORAGE_HEADER_CACHE.update(new_cache_entries)
+                return results
+
+        # Non-sharded path: reuse cached metadata for immutable object-storage paths.
+        cached_results: Dict[int, SafetensorsMetadata] = {}
+        uncached_indices: List[int] = []
+        if cache_enabled:
+            with _HEADER_CACHE_LOCK:
+                for i, path in enumerate(filenames):
+                    if _is_object_storage_path(path) and path in _OBJECT_STORAGE_HEADER_CACHE:
+                        cached_results[i] = _OBJECT_STORAGE_HEADER_CACHE[path][2]
+                    else:
+                        uncached_indices.append(i)
+        else:
+            uncached_indices = list(range(len(filenames)))
+
+        if not uncached_indices:
+            if discover_ranks and hasattr(params, "discover_local_ranks"):
+                try:
+                    params.discover_local_ranks()
+                except Exception:
+                    if not _dist_mod._distribution_is_lost():
+                        raise
+            return [cached_results[i] for i in range(len(filenames))]
+
+        # a distributed load discovers in its first read, because that read fixes the queue depth of the CPP layer
+        raw_headers = SafetensorsMetadata._read_raw_headers(
+            fs,
+            [filenames[i] for i in uncached_indices],
+            s3_credentials,
+            discover_ranks=discover_ranks,
+        )
+
+        new_cache_entries = {}
+        for local_i, global_i in enumerate(uncached_indices):
+            path = filenames[global_i]
+            header_size, raw_json = raw_headers[local_i]
+            smeta = SafetensorsMetadata._build_metadata_from_raw(path, header_size, raw_json)
+            cached_results[global_i] = smeta
+            if cache_enabled and _is_object_storage_path(path):
+                new_cache_entries[path] = (header_size, raw_json, smeta)
+
+        if new_cache_entries:
+            with _HEADER_CACHE_LOCK:
+                _OBJECT_STORAGE_HEADER_CACHE.update(new_cache_entries)
+
+        return [cached_results[i] for i in range(len(filenames))]
 
 class SafetensorMetadata:
     def __init__(self, name: str, safetensorMetadata: Any) -> None:
